@@ -10,8 +10,8 @@ archive_a: Archives
 archive_b: "Archives: %s"
 page: Page %d
 recent_posts: Recent Posts
-newer: Newer
-older: Older
+newer: Previous
+older: Next
 share: Share
 powered_by: Powered by
 rss_feed: RSS Feed

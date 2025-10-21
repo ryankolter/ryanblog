@@ -1,3 +1,3 @@
-My Blog
+## My Blog
 
-[link](ryanblog.pages.dev)
+[https://ryanblog.pages.dev](https://ryanblog.pages.dev)

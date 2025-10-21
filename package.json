@@ -6,7 +6,8 @@
     "build": "hexo generate",
     "clean": "hexo clean",
     "deploy": "hexo deploy",
-    "server": "hexo server"
+    "server": "hexo server",
+    "cf:deploy": "npm run build && wrangler pages deploy public --project-name=ryanblog"
   },
   "hexo": {
     "version": "8.0.0"

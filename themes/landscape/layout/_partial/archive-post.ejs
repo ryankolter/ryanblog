@@ -1,11 +1,12 @@
-<article class="archive-article archive-type-<%= post.layout %>" style="display: block; width: 100%; margin-bottom: 15px;">
+<article
+  class="archive-article archive-type-<%= post.layout %>"
+  style="display: block; width: 100%; margin-bottom: 15px"
+>
   <div class="archive-article-inner">
     <header class="archive-article-header">
-      <% if (post.top_order) { %>
-        <span class="archive-article-order" style="color: #999; margin-right: 10px;">[<%= post.top_order %>]</span>
-      <% } %>
-      <%- partial('post/date', {class_name: 'archive-article-date', date_format: 'MMM D'}) %>
-      <%- partial('post/title', {class_name: 'archive-article-title'}) %>
+      <%- partial('post/date', {class_name: 'archive-article-date', date_format:
+      'MMM D'}) %> <%- partial('post/title', {class_name:
+      'archive-article-title'}) %>
     </header>
   </div>
 </article>

@@ -1,0 +1,1355 @@
+---
+title: CUDA并行编程：理解Grid、Block、Thread
+date: 2025-10-21 15:49:18
+tags:
+---
+
+GPU 有上万个 CUDA 核心，如何告诉它们各自该做什么？如何协调它们？
+
+为什么不能用 CPU 的线程模型？
+
+<!--more-->
+
+---
+
+## 1. CPU 线程模型的局限
+
+### 单个 CPU 线程有多"重"？
+
+在 Linux 系统中，创建一个线程的开销是：
+
+```
+单个线程占用：
+├─ 内核栈：8 KB
+├─ 用户栈：8 MB（默认）
+├─ 线程控制块：~1 KB
+└─ 线程局部存储：~4 KB
+总计：约8 MB内存
+```
+
+如果在 CPU 上创建 10,000 个线程（GPU 常见的并行度）：
+
+```
+内存需求 = 10,000 × 8 MB = 80 GB
+```
+
+即使内存够用，上下文切换的开销也会压垮系统。每次从线程 A 切换到线程 B：
+
+| 步骤            | 操作                           | 延迟                        |
+| --------------- | ------------------------------ | --------------------------- |
+| 保存线程 A 状态 | 16-32 个寄存器 + PC + 标志位   | ~50 cycles                  |
+| TLB 刷新        | 清空虚拟地址转换缓存           | ~100 cycles                 |
+| 缓存污染        | 线程 B 的数据驱逐线程 A 的缓存 | ~1000 cycles                |
+| 恢复线程 B 状态 | 从内存加载寄存器上下文         | ~50 cycles                  |
+| **总计**        |                                | **~1200 cycles ≈ 0.3 微秒** |
+
+在 5 GHz 的 CPU 上，每次上下文切换损失约 0.3 微秒。频繁在 10,000 个线程间切换，开销完全无法接受。
+
+### 深度学习需要什么样的并行？
+
+以矩阵乘法为例：
+
+```python
+# 计算 C = A × B
+# A: [4096, 4096], B: [4096, 4096]
+
+for i in range(4096):
+    for j in range(4096):
+        sum = 0.0
+        for k in range(4096):
+            sum += A[i][k] * B[k][j]
+        C[i][j] = sum
+```
+
+这段代码的特征：
+
+- **并行度**：4096 × 4096 = 16,777,216 个独立计算
+- **任务特点**：海量、简单、短生命周期
+- **计算模式**：所有任务执行相同的代码，只是数据不同
+- **无需系统调用**：不访问文件、网络等
+
+CPU 线程模型是为通用场景设计（文件 I/O、网络访问、复杂控制流），这些能力对深度学习来说是累赘。
+
+GPU 需要的是轻量级、海量的并行执行单元。
+
+---
+
+## 2. CUDA 的三层抽象：任务分解的层次
+
+### 从问题出发：如何并行处理 100,000 个数据？
+
+假设我们有一个数组，内含 100,000 个数字，要对每个数字加 1。
+
+**串行方案**（CPU）：一个 thread 循环算 10 万次
+
+```c
+for (int i = 0; i < 100000; i++) {
+    output[i] = input[i] + 1;
+}
+```
+
+**并行方案**（GPU）: 分派给 10 万个 thread 同时算
+
+需要分解任务，从下到上划分层级
+
+| 任务     | 层级       | 解释                                                     |
+| -------- | ---------- | -------------------------------------------------------- |
+| 执行工作 | **Thread** | 按"线程"执行，每个独立计算                               |
+| 组织协作 | **Block**  | 把多个“线程”组织成"块"，方便邻近的线程协作               |
+| 分配资源 | **Grid**   | 把多个“块”组织成"网格"，一个格子就是一个块，方便资源分配 |
+
+### 三层抽象的精确计算
+
+**第一步：确定单个块内含的“线程数”，也就是 Block 的 Dim 大小**
+
+假定每个 Block 划定 256 个 Thread —— Dim 大小是 32 \* 8。
+
+```
+以2D方式组织，内部 32 * 8 个 Thread 可视化如下:
+
+┌──────────────────────────────────────┐
+│  Thread  Thread  Thread  Thread ...  │
+│    0       1       2       3    ...  │  ← 第1排：32个Thread
+├──────────────────────────────────────┤
+│  Thread  Thread  Thread  Thread ...  │
+│   32      33      34      35    ...  │  ← 第2排：32个Thread
+├──────────────────────────────────────┤
+│            ...                       │
+├──────────────────────────────────────┤
+│  Thread  Thread  Thread  Thread ...  │
+│   224     225     226     227   ...  │  ← 第8排：32个Thread
+└──────────────────────────────────────┘
+
+Block提供的协作机制：
+├─ Shared Memory（64 KB）：所有Thread共享
+├─ __syncthreads()：等待所有Thread到达同一点
+└─ 邻近Thread可以快速通信
+```
+
+**第二步：计算需要多少个块 Block**
+
+```
+数据总量：100,000
+每个Block处理：256个数据
+需要Block数：⌈100,000 / 256⌉ = 391个Block
+```
+
+**第三步：组织 Grid 的结构**
+
+391 个 Block 可以组织成 1D 或 2D：
+
+- 1D: Grid(391)
+- 2D: Grid(10, 40) = 400 个 Block（多余的 Block 通过边界检查跳过）
+
+```
+以2D方式组织，内部 10 * 40 个 Block 可视化如下:
+
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ 0  │ 1  │ 2  │ 3  │ 4  │ 5  │ 6  │ 7  │ 8  │ 9  │  ← 每行10个Block
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ 10 │ 11 │ 12 │ 13 │ 14 │ 15 │ 16 │ 17 │ 18 │ 19 │
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ 20 │ 21 │ 22 │ 23 │ 24 │ 25 │ 26 │ 27 │ 28 │ 29 │
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│... │... │... │... │... │... │... │... │... │... │
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│390 │391 │392 │393 │394 │395 │396 │397 │398 │399 │  ← 第40行
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+
+每个块（Block）发一份资源：
+├─ 64 KB Shared Memory
+├─ 一个同步屏障（__syncthreads()）
+├─ 256个Thread，分配到同一个SM执行
+```
+
+### 三层抽象的设计哲学
+
+CUDA 将并行计算组织为三个层次：**Grid → Block → Thread**。这不是任意的设计，而是精确映射到 GPU 的硬件结构。
+
+```
+软件抽象           硬件对应
+┌─────────────┐   ┌──────────────┐
+│   Grid      │ → │  整个GPU      │
+│  (Kernel)   │   │  (所有SM)     │
+└─────────────┘   └──────────────┘
+      │                  │
+      ├── Block 0  →  调度到 SM 0
+      ├── Block 1  →  调度到 SM 1
+      ├── Block 2  →  调度到 SM 2
+      │   ...           ...
+      └── Block N  →  调度到 SM x
+            │                │
+            ├── Thread 0     │
+            ├── Thread 1     │  在SM内部
+            │   ...          │  组成warp
+            └── Thread M     │
+```
+
+### 对应资源
+
+```
+软件抽象              硬件对应                资源含义
+┌─────────────┐      ┌──────────────┐
+│   Grid      │  →   │  整个GPU      │      任务如何分配到所有SM
+│  (400个     │      │  (132个SM)    │      一个SM可以执行多个Block
+│   Block)    │      │              │
+└─────────────┘      └──────────────┘
+      ↓                     ↓
+┌─────────────┐      ┌──────────────┐
+│   Block     │  →   │  单个SM       │      独立的调度单元
+│  (256个     │      │  最多2048个   │      共享64KB Shared Memory
+│   Thread)   │      │  Thread驻留  │      可以执行__syncthreads()
+└─────────────┘      └──────────────┘
+      ↓                     ↓
+┌─────────────┐      ┌──────────────┐
+│   Thread    │  →   │  CUDA Core    │      独立的计算任务
+│  (1个计算)   │      │  (1个FP32/    │      有独立的寄存器
+│             │      │   INT32单元)  │      执行一个数的计算
+└─────────────┘      └──────────────┘
+```
+
+**关键对应表，从上到下**：
+
+| 软件层     | 硬件层             | 为什么需要这一层                    |
+| ---------- | ------------------ | ----------------------------------- |
+| **Grid**   | 整个 GPU 的所有 SM | 把任务分解成可以并行执行的 Block    |
+| **Block**  | 分配到单个 SM 执行 | 提供协作机制（Shared Memory、同步） |
+| **Thread** | CUDA Core 执行     | 最小的独立计算任务                  |
+
+**为什么是三层而不是两层？**
+
+如果只有 Grid 和 Thread（没有 Block）：
+
+- 问题 1：Thread 之间无法协作（无 Shared Memory 的共享域）
+- 问题 2：无法使用`__syncthreads()`同步
+- 问题 3：调度粒度太细（SM 需要直接管理数万个 Thread）
+
+Block 层是**协作的边界** + **调度的粒度**。
+
+---
+
+## 3. Thread：一个 Thread 干一件事
+
+### 最简单的例子：假设有 8 个数字，想给每个数加 1：
+
+```
+输入：[1, 2, 3, 4, 5, 6, 7, 8]
+输出：[2, 3, 4, 5, 6, 7, 8, 9]
+```
+
+**串行思维**（CPU）：
+
+```c
+for (int i = 0; i < 8; i++) {
+    output[i] = input[i] + 1;
+}
+```
+
+**并行思维**（GPU）：
+
+```
+8个Thread同时工作：
+Thread 0处理input[0]
+Thread 1处理input[1]
+Thread 2处理input[2]
+...
+Thread 7处理input[7]
+```
+
+CUDA 代码：
+
+```cuda
+__global__ void addOne(int* input, int* output, int N) {
+    // 每个Thread计算自己的索引
+    int i = threadIdx.x;
+
+    // 边界检查
+    if (i < N) {
+        output[i] = input[i] + 1;
+    }
+}
+
+// CPU端启动代码
+int N = 8;
+addOne<<<1, N>>>(d_input, d_output, N);
+//       │  └─ 8个Thread
+//       └─ 1个Block
+```
+
+### Thread 的身份标识
+
+每个 Thread 需要知道"我是谁"才能找到自己的数据。CUDA 提供内置变量：
+
+**threadIdx：Thread 在 Block 内的位置**
+
+- `threadIdx.x`：一维索引
+- `threadIdx.y`：二维索引，按照 2D 分配时才出现
+- `threadIdx.z`：三维索引，按照 3D 分配时才出现
+
+### Thread 的资源
+
+每个 Thread 独享：
+
+| 资源                 | 作用               | 类比             |
+| -------------------- | ------------------ | ---------------- |
+| **寄存器**           | 存储局部变量       | 房间内的私人物品 |
+| **局部内存**         | 寄存器溢出时使用   | 储物间           |
+| **程序计数器（PC）** | 当前执行到哪条指令 | 当前在做什么     |
+
+Thread 之间完全独立，互不干扰。
+
+---
+
+## 4. Block：协作的工作组
+
+### 为什么需要 Block？
+
+有些计算需要多个 Thread 协作。比如对 256 个数求和：
+
+```
+数据：[1, 2, 3, ..., 256]
+目标：求总和
+```
+
+**朴素做法**（不可行）：
+
+```cuda
+// 每个Thread只能看到自己的数
+int value = input[threadIdx.x];
+// 无法访问其他Thread的value！
+```
+
+**解决方案**：让这 256 个 Thread 属于同一个 Block，Block 提供：
+
+1. **共享内存（Shared Memory）**：Block 内所有 Thread 可访问
+2. **同步机制（`__syncthreads()`）**：等待 Block 内所有 Thread 完成
+
+类比楼栋的公共空间：
+
+```
+楼栋内的大堂（Shared Memory）：
+- 所有房间共享
+- 比小区门口（Global Memory）近得多
+- 但只有本楼居民能访问
+
+楼栋内的通知板（同步点）：
+- 物业：所有住户都到大堂，完成后在通知板签到
+- __syncthreads()就是这个签到点
+```
+
+至于 Grid，只不过是一个由 Block 按特定维度排列而成的顶层概念，只有一个，表现为 GridDim
+
+### Block 内协作的完整例子：Reduce 求和
+
+```cuda
+__global__ void reduceSum(float* input, float* output) {
+    // 1. 声明Shared Memory（楼栋的大堂）
+    __shared__ float temp[256];
+
+    int tid = threadIdx.x;  // 如果只有一层，就是一层的房间号（0-255）
+
+    // 2. 每个Thread从全局内存加载数据到Shared Memory
+    temp[tid] = input[blockIdx.x * 256 + tid];
+    __syncthreads();  // 等待所有Thread完成加载
+
+    // 3. 树形归约：相邻两两相加
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            temp[tid] += temp[tid + stride];
+        }
+        __syncthreads();  // 每轮归约后同步
+    }
+
+    // 4. Thread 0写出本Block的结果
+    if (tid == 0) {
+        output[blockIdx.x] = temp[0];
+    }
+}
+```
+
+执行过程可视化（256 个 Thread，初始值为 1）：
+
+```
+轮次1: stride=128
+  Thread 0: temp[0] += temp[128]  → temp[0]=2
+  Thread 1: temp[1] += temp[129]  → temp[1]=2
+  ...
+  Thread 127: temp[127] += temp[255] → temp[127]=2
+  [前128个位置现在各存2]
+
+轮次2: stride=64
+  Thread 0: temp[0] += temp[64]  → temp[0]=4
+  Thread 1: temp[1] += temp[65]  → temp[1]=4
+  ...
+  [前64个位置现在各存4]
+
+... 继续归约 ...
+
+轮次8: stride=1
+  Thread 0: temp[0] += temp[1]  → temp[0]=256
+  [temp[0]现在是总和]
+```
+
+关键点：
+
+- 没有 Shared Memory：Thread 无法访问彼此的数据
+- 没有`__syncthreads()`：可能读到未更新的数据
+
+### Block 的独立性
+
+**关键特性**：不同 Block 之间完全独立，无法通信（除了通过全局内存）。
+
+类比：
+
+```
+楼栋1的居民：不能进入楼栋2的大堂
+楼栋1和楼栋2：可以独立施工，互不影响
+GPU调度：可以把楼栋1分配给SM0，楼栋2分配给SM1
+```
+
+这个设计保证了可扩展性：
+
+- 在 8 个 SM 的 GPU 上：8 个 Block 同时执行
+- 在 132 个 SM 的 GPU 上：132 个 Block 同时执行
+- 代码不变！
+
+---
+
+## 5. 一维配置：处理向量数据
+
+### 问题：100,000 个数字，每个加 1
+
+```
+输入：[1, 2, 3, ..., 100000]
+输出：[2, 3, 4, ..., 100001]
+```
+
+### 精确的配置计算
+
+**第一步：选择 Block 大小**
+
+选择 `blockDim.x = 256`（每个 Block 有 256 个 Thread）
+
+**第二步：计算 Grid 大小**
+
+```
+数据总量 N = 100,000
+每个Block处理 = 256个元素
+需要Block数 = ⌈100,000 / 256⌉ = 391个Block
+```
+
+向上取整公式：
+
+```c
+int blocksPerGrid = (N + blockDim.x - 1) / blockDim.x;
+// (100000 + 255) / 256 = 391
+```
+
+### 一维 Grid 的可视化
+
+```
+Grid: 391个Block排成一行
+
+Block 0   Block 1   Block 2   ...   Block 390
+┌──────┐   ┌──────┐   ┌──────┐         ┌──────┐
+│256   │   │256   │   │256   │   ...   │256   │
+│个    │   │个     │   │个    │         │个    │
+│Thread│   │Thread│   │Thread│         │Thread│
+└──────┘   └──────┘   └──────┘         └──────┘
+处理        处理        处理             处理
+0-255      256-511     512-767         99840-100095
+
+总共启动: 391 × 256 = 100,096个Thread
+实际使用: 100,000个Thread（后96个通过if判断越界，跳过）
+```
+
+### 单个 Block 的内部结构
+
+```
+Block 0内部（256个Thread）：
+
+Thread:  0    1   2   3  ... 254 255
+        ┌───┬───┬───┬───┬───┬───┬───┐
+        │ 0 │ 1 │ 2 │ 3 │...│254│255│ 索引
+        └───┴───┴───┴───┴───┴───┴───┘
+处理:  input[0]  input[1]  ...  input[255]
+       ↓         ↓               ↓
+       output[0] output[1] ...   output[255]
+```
+
+### 完整代码
+
+```cuda
+__global__ void addOne(int* input, int* output, int N) {
+    // 计算全局索引
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 边界检查（因为391×256 = 100,096 > 100,000）
+    if (i < N) {
+        output[i] = input[i] + 1;
+    }
+}
+
+// CPU端启动
+int N = 100000;
+int threadsPerBlock = 256;
+int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+// blocksPerGrid = 391
+
+addOne<<<blocksPerGrid, threadsPerBlock>>>(d_input, d_output, N);
+```
+
+### 索引计算详解
+
+每个 Thread 需要知道自己处理哪个数据：
+
+```
+Block 5的Thread 10：
+
+全局索引 i = blockIdx.x × blockDim.x + threadIdx.x
+         i = 5 × 256 + 10
+         i = 1290
+
+这个Thread处理：
+  input[1290] → output[1290]
+```
+
+blockIdx.x × blockDim.x 相当于跳过了前面所有 Block 里的 Thread，再加上在本 block 里的偏移量 threadIdx.x
+
+**内置变量**：
+
+| 变量          | 含义                             | 取值范围    | 例子                           |
+| ------------- | -------------------------------- | ----------- | ------------------------------ |
+| `blockIdx.x`  | Block 在 一维 Grid 中的索引      | 0 到 390    | Block 5 → `blockIdx.x = 5`     |
+| `blockDim.x`  | Block 的大小，在一维里表现为长度 | 256（常量） | 每个 Block 有 256 个 Thread    |
+| `threadIdx.x` | Thread 在 Block 中的索引         | 0 到 255    | Thread 10 → `threadIdx.x = 10` |
+
+**为什么需要`if (i < N)`？**
+
+```
+最后一个Block (Block 390)：
+  blockIdx.x = 390
+  处理索引范围：390 × 256 = 99,840 到 100,095
+
+但数据只有100,000个！
+  Thread 0-159：处理 99,840 到 99,999（有效）
+  Thread 160-255：索引 100,000 到 100,095（越界！）
+
+没有if检查会导致：
+  ✗ 访问非法内存
+  ✗ 程序崩溃或数据错误
+```
+
+---
+
+## 6. 二维配置：处理图像数据
+
+### 问题：1024×1024 的图像转灰度
+
+```
+输入：RGB图像 [1024][1024][3]
+输出：灰度图像 [1024][1024]
+
+每个像素：gray = 0.299*R + 0.587*G + 0.114*B
+```
+
+### 为什么用 2D 配置？
+
+虽然内存中图像是一维数组存储：
+
+```
+[R0,G0,B0, R1,G1,B1, R2,G2,B2, ...]
+```
+
+但用 2D 配置的优势：
+
+1. **代码直观**：`(x, y)`对应像素坐标
+2. **访问局部性**：相邻 Thread 处理相邻像素
+3. **边界清晰**：`if (x < width && y < height)`
+
+### 精确的配置计算
+
+**第一步：选择 Block 大小（2D）**
+
+选择 `blockDim = (16, 16)`，即每个 Block 是 16×16 = 256 个 Thread
+
+**第二步：计算 Grid 大小（2D）**
+
+```
+图像尺寸：1024 × 1024
+每个Block：16 × 16
+
+Grid x方向：⌈1024 / 16⌉ = 64个Block
+Grid y方向：⌈1024 / 16⌉ = 64个Block
+
+总共：64 × 64 = 4,096个Block
+```
+
+### 二维 Grid 的可视化（8×8 的简化版本）
+
+为了便于展示，我们用一个 8×8 的 Grid（实际是 64×64）：
+
+```
+Grid: 8×8 = 64个Block的平面布局
+
+      Block列: 0      1      2      3      4      5      6      7
+           ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+Row 0      │(0,0) │(1,0) │(2,0) │(3,0) │(4,0) │(5,0) │(6,0) │(7,0) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 1      │(0,1) │(1,1) │(2,1) │(3,1) │(4,1) │(5,1) │(6,1) │(7,1) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 2      │(0,2) │(1,2) │(2,2) │(3,2) │(4,2) │(5,2) │(6,2) │(7,2) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 3      │(0,3) │(1,3) │(2,3) │(3,3) │(4,3) │(5,3) │(6,3) │(7,3) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 4      │(0,4) │(1,4) │(2,4) │(3,4) │(4,4) │(5,4) │(6,4) │(7,4) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 5      │(0,5) │(1,5) │(2,5) │(3,5) │(4,5) │(5,5) │(6,5) │(7,5) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 6      │(0,6) │(1,6) │(2,6) │(3,6) │(4,6) │(5,6) │(6,6) │(7,6) │
+           ├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+Row 7      │(0,7) │(1,7) │(2,7) │(3,7) │(4,7) │(5,7) │(6,7) │(7,7) │
+           └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+
+每个格子是一个Block
+格子内的数字(x, y)是Block的坐标：blockIdx.x, blockIdx.y
+```
+
+**映射到图像**：
+
+```
+如果每个Block处理16×16像素，那么Grid (8,8)处理的图像大小是：
+8 × 16 = 128像素宽
+8 × 16 = 128像素高
+总共：128×128图像
+```
+
+### 单个 Block 的内部结构
+
+让我们拿出 Block (2, 3)看它的内部：
+
+```
+Block (2, 3)内部：16×16 = 256个Thread
+
+      Thread列: 0   1   2   3   ...  14  15
+           ┌────┬────┬───┬───┬───┬─────┬─────┐
+Row 0      │0,0 │1,0 │2,0│3,0│...│14,0 │15,0 │
+           ├────┼────┼───┼───┼───┼─────┼─────┤
+Row 1      │0,1 │1,1 │2,1│3,1│...│14,1 │15,1 │
+           ├────┼────┼───┼───┼───┼─────┼─────┤
+Row 2      │0,2 │1,2 │2,2│3,2│...│14,2 │15,2 │
+           ├────┼────┼───┼───┼───┼─────┼─────┤
+  ...      │... │... │...│...│...│ ... │ ... │
+           ├────┼────┼───┼───┼───┼─────┼─────┤
+Row 15     │0,15│1,15│...│   │...│14,15│15,15│
+           └────┴────┴───┴───┴───┴─────┴─────┘
+
+每个格子内的(x, y)是Thread坐标：threadIdx.x, threadIdx.y
+```
+
+**这个 Block 处理图像的哪部分？**
+
+```
+Block (2, 3)：
+  blockIdx.x = 2
+  blockIdx.y = 3
+
+处理的像素范围：
+  x方向：2 × 16 = 32 到 (2+1) × 16 - 1 = 47
+  y方向：3 × 16 = 48 到 (3+1) × 16 - 1 = 63
+
+即：处理图像中 [32:47, 48:63] 这个16×16的区域
+```
+
+### 二维索引计算详解
+
+**Thread (5, 7) 在 Block (2, 3) 中**：
+
+```
+步骤1：计算像素的x坐标（列）
+x = blockIdx.x × blockDim.x + threadIdx.x
+x = 2 × 16 + 5
+x = 37
+
+步骤2：计算像素的y坐标（行）
+y = blockIdx.y × blockDim.y + threadIdx.y
+y = 3 × 16 + 7
+y = 55
+
+步骤3：转换为一维数组索引（row-major）
+idx = y × width + x
+idx = 55 × 128 + 37
+idx = 7077
+
+这个Thread处理：
+  输入：rgb[7077] 的RGB值
+  输出：gray[7077] 的灰度值
+```
+
+### 完整代码
+
+```cuda
+__global__ void rgb2gray(uchar3* rgb, uchar* gray, int width, int height) {
+    // 计算二维坐标
+    int x = blockIdx.x * blockDim.x + threadIdx.x;  // 列
+    int y = blockIdx.y * blockDim.y + threadIdx.y;  // 行
+
+    // 边界检查
+    if (x < width && y < height) {
+        // 二维转一维
+        int idx = y * width + x;
+
+        // 获取RGB像素
+        uchar3 pixel = rgb[idx];
+
+        // 转灰度
+        gray[idx] = 0.299f * pixel.x + 0.587f * pixel.y + 0.114f * pixel.z;
+    }
+}
+
+// CPU端启动
+int width = 1024;
+int height = 1024;
+
+dim3 threadsPerBlock(16, 16);  // 16×16 = 256个Thread
+dim3 blocksPerGrid(
+    (width + 15) / 16,   // x方向：64个Block
+    (height + 15) / 16   // y方向：64个Block
+);
+// blocksPerGrid = (64, 64)
+
+rgb2gray<<<blocksPerGrid, threadsPerBlock>>>(d_rgb, d_gray, width, height);
+```
+
+dim3 用于声明多维 Grid 和 多维 Block
+
+### 二维配置的内置变量
+
+| 变量          | 含义                       | Grid (64,64) + Block (16,16) 的例子 |
+| ------------- | -------------------------- | ----------------------------------- |
+| `blockIdx.x`  | Block 在 Grid 中的列索引   | 0 到 63                             |
+| `blockIdx.y`  | Block 在 Grid 中的行索引   | 0 到 63                             |
+| `blockDim.x`  | Block 的宽度（列数）       | 16                                  |
+| `blockDim.y`  | Block 的高度（行数）       | 16                                  |
+| `threadIdx.x` | Thread 在 Block 中的列索引 | 0 到 15                             |
+| `threadIdx.y` | Thread 在 Block 中的行索引 | 0 到 15                             |
+| `gridDim.x`   | Grid 的宽度（Block 列数）  | 64                                  |
+| `gridDim.y`   | Grid 的高度（Block 行数）  | 64                                  |
+
+**完整的索引公式**：
+
+```cuda
+// 像素坐标
+int x = blockIdx.x * blockDim.x + threadIdx.x;
+int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+// 一维数组索引
+int idx = y * width + x;
+```
+
+---
+
+## 7. 三维配置：处理体积数据
+
+三维配置用于处理 3D 数据，如医学影像、视频（时间+空间）、物理模拟等。
+
+### 基本概念
+
+```
+Grid: (gridDim.x, gridDim.y, gridDim.z) 维度数据
+Block: (blockDim.x, blockDim.y, blockDim.z) 维度数据
+Thread: (threadIdx.x, threadIdx.y, threadIdx.z) 坐标数据
+
+在某个Block内的索引计算：
+int x = blockIdx.x * blockDim.x + threadIdx.x;
+int y = blockIdx.y * blockDim.y + threadIdx.y;
+int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+一维索引：
+int idx = z * (width * height) + y * width + x;
+```
+
+### 硬件限制
+
+| 维度         | 最大值 | 常用值  | 说明           |
+| ------------ | ------ | ------- | -------------- |
+| `blockDim.x` | 1024   | 8-16    |                |
+| `blockDim.y` | 1024   | 8-16    |                |
+| `blockDim.z` | 64     | 4-8     | **z 维度较小** |
+| 总 Thread 数 | 1024   | 256-512 | x×y×z ≤ 1024   |
+
+**为什么 z 维度小？**
+
+硬件限制：`blockDim.z`最大只有 64，所以 3D 配置常用：
+
+- (16, 16, 4) = 1024 个 Thread
+- (8, 8, 8) = 512 个 Thread
+- (32, 32, 1) = 1024 个 Thread（实际是 2D）
+
+### 简单示例
+
+```cuda
+__global__ void process3D(float* data, int W, int H, int D) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x < W && y < H && z < D) {
+        int idx = z * (W * H) + y * W + x;
+        // 处理data[idx]...
+    }
+}
+
+// 启动
+dim3 block(8, 8, 8);
+dim3 grid((W+7)/8, (H+7)/8, (D+7)/8);
+process3D<<<grid, block>>>(d_data, W, H, D);
+```
+
+**实际应用中**，3D 配置使用较少，大多数问题用 1D 或 2D 就够了。
+
+---
+
+## 8. 层级关系总结：内置变量与索引公式
+
+### 完整的变量体系
+
+```
+Grid层级（定义任务规模）：
+  gridDim.x/y/z       Grid的维度（有多少个Block）
+  blockIdx.x/y/z      当前Block在Grid中的索引（0开始）
+
+Block层级（定义协作单元）：
+  blockDim.x/y/z      Block的维度（有多少个Thread）
+  threadIdx.x/y/z     当前Thread在Block中的索引（0开始）
+
+常量：
+  warpSize            Warp大小（恒为32，下一篇详解）
+```
+
+### 索引计算公式总表
+
+| 维度   | 全局坐标计算                                                                                                                              | 一维数组索引                                 |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| **1D** | `i = blockIdx.x * blockDim.x + threadIdx.x`                                                                                               | `idx = i`                                    |
+| **2D** | `x = blockIdx.x * blockDim.x + threadIdx.x`<br>`y = blockIdx.y * blockDim.y + threadIdx.y`                                                | `idx = y * width + x`                        |
+| **3D** | `x = blockIdx.x * blockDim.x + threadIdx.x`<br>`y = blockIdx.y * blockDim.y + threadIdx.y`<br>`z = blockIdx.z * blockDim.z + threadIdx.z` | `idx = z * (width * height) + y * width + x` |
+
+### 配置限制（H100 GPU）
+
+| 参数            | 限制        | 说明               |
+| --------------- | ----------- | ------------------ |
+| `blockDim.x`    | 最大 1024   | 单维度限制         |
+| `blockDim.y`    | 最大 1024   | 单维度限制         |
+| `blockDim.z`    | 最大 64     | z 维度较小         |
+| **Thread 总数** | **≤1024**   | blockDim.x × y × z |
+| `gridDim.x`     | 最大 2^31-1 | Grid 可以很大      |
+| `gridDim.y`     | 最大 65535  |                    |
+| `gridDim.z`     | 最大 65535  |                    |
+
+### 从配置到资源的映射
+
+```
+软件配置               硬件资源              资源分配
+──────────────────────────────────────────────────────
+Grid (400 Blocks)  →  132个SM           每个SM执行3-4个Block
+                                        (400 / 132 ≈ 3)
+
+Block (256 Threads) → 单个SM驻留      消耗SM资源：
+                                      - 寄存器：256 × N个
+                                      - Shared Memory：X KB
+                                      - 线程槽：256个
+
+Thread (1个任务)   →  CUDA Core       使用：
+                                      - 寄存器：N个
+                                      - 执行1个数的计算
+```
+
+**关键理解**：
+
+- Grid 大小由**问题规模**决定（要处理多少数据）
+- Block 大小由**协作需求**和**资源限制**决定
+- Thread 索引由内置变量自动提供，反映了在 Block 内的位置
+
+---
+
+## 9. 由浅入深的实战案例
+
+前面我们学习了向量加法（1D）和图像转灰度（2D）。现在看几个需要 Block 内协作的进阶案例。
+
+### 案例 1：点乘（需要 Reduce）
+
+**问题**：计算两个向量的点乘 `result = A·B = sum(A[i] * B[i])`
+
+```
+A = [1, 2, 3, 4, ...]
+B = [5, 6, 7, 8, ...]
+点乘 = 1×5 + 2×6 + 3×7 + 4×8 + ...
+```
+
+**挑战**：每个 Thread 计算一个乘积，但需要把所有乘积加起来。
+
+**解决方案**：两阶段计算
+
+```cuda
+// 阶段1：每个Block计算部分和
+__global__ void dotProductKernel(float* A, float* B, float* partialSum, int N) {
+    // 声明Shared Memory（Block内共享）
+    __shared__ float cache[256];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 每个Thread计算一个乘积，存入Shared Memory
+    cache[tid] = (i < N) ? A[i] * B[i] : 0.0f;
+    __syncthreads();  // 等待Block内所有Thread完成
+
+    // Block内归约（树形求和）
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            cache[tid] += cache[tid + stride];
+        }
+        __syncthreads();  // 每轮归约后同步
+    }
+
+    // Thread 0写出本Block的部分和
+    if (tid == 0) {
+        partialSum[blockIdx.x] = cache[0];
+    }
+}
+
+// CPU端完整流程
+void dotProduct(float* h_A, float* h_B, int N, float* result) {
+    float *d_A, *d_B, *d_partialSum;
+
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (N + 255) / 256;
+
+    // 分配内存
+    cudaMalloc(&d_A, N * sizeof(float));
+    cudaMalloc(&d_B, N * sizeof(float));
+    cudaMalloc(&d_partialSum, blocksPerGrid * sizeof(float));
+
+    // 拷贝数据
+    cudaMemcpy(d_A, h_A, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, N * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 阶段1：GPU计算部分和
+    dotProductKernel<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_partialSum, N);
+
+    // 阶段2：CPU对部分和求和（或再次调用kernel）
+    float* h_partialSum = new float[blocksPerGrid];
+    cudaMemcpy(h_partialSum, d_partialSum, blocksPerGrid * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    *result = 0;
+    for (int i = 0; i < blocksPerGrid; i++) {
+        *result += h_partialSum[i];
+    }
+
+    // 清理
+    delete[] h_partialSum;
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_partialSum);
+}
+```
+
+**关键点**：
+
+- `__shared__`：Block 内共享内存，速度快
+- `__syncthreads()`：确保所有 Thread 完成当前阶段
+- 树形归约：log2(256) = 8 轮，比串行快 32 倍
+
+**归约过程可视化**（Block 内 256 个 Thread）：
+
+```
+初始：cache[0]=v0, cache[1]=v1, ..., cache[255]=v255
+
+轮1 (stride=128):
+  Thread 0: cache[0] += cache[128]
+  Thread 1: cache[1] += cache[129]
+  ...
+  Thread 127: cache[127] += cache[255]
+  [前128个位置现在各存2个值的和]
+
+轮2 (stride=64):
+  Thread 0-63活跃
+  [前64个位置现在各存4个值的和]
+
+...
+
+轮8 (stride=1):
+  Thread 0: cache[0] += cache[1]
+  [cache[0]现在是256个值的总和]
+```
+
+### 案例 2：矩阵转置（2D 索引映射）
+
+**问题**：转置 N×N 矩阵（行列互换）
+
+```
+输入:               输出:
+[1  2  3]          [1  4  7]
+[4  5  6]    →     [2  5  8]
+[7  8  9]          [3  6  9]
+```
+
+**朴素版本**（有性能问题）：
+
+```cuda
+__global__ void transposeNaive(float* input, float* output, int N) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < N && y < N) {
+        int idxIn = y * N + x;      // input[y][x]
+        int idxOut = x * N + y;     // output[x][y]
+        output[idxOut] = input[idxIn];
+    }
+}
+
+// 启动（假设N=1024）
+dim3 block(16, 16);
+dim3 grid((N + 15) / 16, (N + 15) / 16);
+transposeNaive<<<grid, block>>>(d_input, d_output, N);
+```
+
+**问题**：内存访问不连续（细节留给内存优化篇）
+
+- 读 input：连续（好）
+- 写 output：跳跃（差）
+
+**优化版本**（使用 Shared Memory）：
+
+```cuda
+__global__ void transposeOptimized(float* input, float* output, int N) {
+    // Shared Memory作为中转
+    __shared__ float tile[16][16];
+
+    int x = blockIdx.x * 16 + threadIdx.x;
+    int y = blockIdx.y * 16 + threadIdx.y;
+
+    // 读input到Shared Memory（连续读）
+    if (x < N && y < N) {
+        tile[threadIdx.y][threadIdx.x] = input[y * N + x];
+    }
+    __syncthreads();
+
+    // 计算转置后的坐标
+    x = blockIdx.y * 16 + threadIdx.x;  // 注意：x和y的blockIdx互换
+    y = blockIdx.x * 16 + threadIdx.y;
+
+    // 从Shared Memory写到output（连续写）
+    if (x < N && y < N) {
+        output[y * N + x] = tile[threadIdx.x][threadIdx.y];  // 注意：索引转置
+    }
+}
+```
+
+**关键点**：
+
+- Shared Memory 充当缓冲区
+- 将不规则访问转换为规则访问
+- 性能提升：约 2-3 倍（细节分析留给内存篇）
+
+### 案例 3：图像卷积（边界处理）
+
+**问题**：3×3 卷积核对图像卷积
+
+```
+卷积核:              图像:
+[-1  0  1]          [a b c]
+[-2  0  2]    ×     [d e f]
+[-1  0  1]          [g h i]
+
+结果 = -a + c - 2d + 2f - g + i（边缘检测）
+```
+
+```cuda
+__global__ void conv2D(float* input, float* output,
+                       int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // 边界处理：跳过最外一圈像素
+    if (x >= 1 && x < width - 1 && y >= 1 && y < height - 1) {
+        float sum = 0.0f;
+
+        // Sobel边缘检测（x方向）
+        sum += -1 * input[(y-1) * width + (x-1)];
+        sum +=  0 * input[(y-1) * width + x];
+        sum +=  1 * input[(y-1) * width + (x+1)];
+
+        sum += -2 * input[y * width + (x-1)];
+        sum +=  0 * input[y * width + x];
+        sum +=  2 * input[y * width + (x+1)];
+
+        sum += -1 * input[(y+1) * width + (x-1)];
+        sum +=  0 * input[(y+1) * width + (x-1)];
+        sum +=  1 * input[(y+1) * width + (x+1)];
+
+        output[y * width + x] = sum;
+    }
+}
+```
+
+**关键点**：
+
+- 边界检查：`x >= 1 && x < width - 1`
+- 每个 Thread 读取周围 9 个像素
+- 优化空间：用 Shared Memory 预加载 tile（留给后续）
+
+### 案例 4：直方图统计（原子操作）
+
+**问题**：统计图像的灰度直方图（0-255 每个值出现多少次）
+
+```cuda
+__global__ void histogram(uchar* image, int* hist, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N) {
+        uchar pixel = image[i];
+        // 原子加：多个Thread可能同时更新hist[pixel]
+        atomicAdd(&hist[pixel], 1);
+    }
+}
+
+// 启动
+int N = 1024 * 1024;  // 1M像素
+int* d_hist;
+cudaMalloc(&d_hist, 256 * sizeof(int));
+cudaMemset(d_hist, 0, 256 * sizeof(int));  // 初始化为0
+
+histogram<<<(N+255)/256, 256>>>(d_image, d_hist, N);
+```
+
+**关键点**：
+
+- `atomicAdd()`：保证多个 Thread 同时更新同一内存位置时的正确性
+- 性能问题：原子操作会串行化冲突的访问
+- 优化：先在 Shared Memory 中统计 Block 内的直方图，再合并（留给后续）
+
+---
+
+## 10. 配置选择的实用指南
+
+### Block 大小如何选择？
+
+**必须满足的硬件要求**：
+
+1. **必须是 32 的倍数**
+
+   - 原因：GPU 以 Warp（32 个 Thread）为单位执行（下一篇详解）
+   - 非 32 倍数会浪费资源
+
+2. **总 Thread 数不超过 1024**
+
+   - 1D: `blockDim.x ≤ 1024`
+   - 2D: `blockDim.x × blockDim.y ≤ 1024`
+   - 3D: `blockDim.x × blockDim.y × blockDim.z ≤ 1024`
+
+3. **z 维度不超过 64**
+   - 硬件限制：`blockDim.z ≤ 64`
+
+**推荐的起始配置**：
+
+| 数据维度 | 推荐 Block 大小          | 理由                  |
+| -------- | ------------------------ | --------------------- |
+| 1D       | 256 或 512               | 平衡性能和灵活性      |
+| 2D       | (16, 16) 或 (32, 32)     | 256 或 1024 个 Thread |
+| 3D       | (8, 8, 8) 或 (16, 16, 4) | 512 或 1024 个 Thread |
+
+**示例配置对比**：
+
+```
+1D配置:
+  ✓ 256  (256 = 8 × 32，8个Warp)
+  ✓ 512  (512 = 16 × 32，16个Warp)
+  ✗ 100  (不是32的倍数，浪费资源)
+  ✗ 1536 (超过1024，非法)
+
+2D配置:
+  ✓ (16, 16)  = 256  (8个Warp)
+  ✓ (32, 32)  = 1024 (32个Warp，最大）
+  ✗ (15, 15)  = 225  (不是32的倍数)
+  ✗ (64, 64)  = 4096 (超过1024，非法)
+
+3D配置:
+  ✓ (8, 8, 8)    = 512  (16个Warp)
+  ✓ (16, 16, 4)  = 1024 (32个Warp)
+  ✗ (16, 16, 16) = 4096 (超过1024，非法)
+  ✗ (32, 32, 4)  = 4096 (超过1024，非法)
+```
+
+### Grid 大小如何计算？
+
+**通用公式**（向上取整）：
+
+```cuda
+// 1D情况
+int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+// 2D情况
+dim3 grid(
+    (width + blockDim.x - 1) / blockDim.x,
+    (height + blockDim.y - 1) / blockDim.y
+);
+
+// 3D情况
+dim3 grid(
+    (W + blockDim.x - 1) / blockDim.x,
+    (H + blockDim.y - 1) / blockDim.y,
+    (D + blockDim.z - 1) / blockDim.z
+);
+```
+
+**为什么要向上取整？**
+
+```
+例子：N=1000，threadsPerBlock=256
+
+错误做法：1000 / 256 = 3（整除）
+  → 只启动3个Block = 768个Thread
+  → 只能处理768个数据，丢失232个！
+
+正确做法：(1000 + 255) / 256 = 4
+  → 启动4个Block = 1024个Thread
+  → 能处理所有1000个数据
+  → 最后24个Thread通过if (i < N)跳过
+```
+
+### 何时用 1D/2D/3D？
+
+| 数据类型       | 推荐维度 | 理由                       |
+| -------------- | -------- | -------------------------- |
+| **向量、序列** | 1D       | 数据天然是线性的           |
+| **图像、矩阵** | 2D       | 利用空间局部性，代码更直观 |
+| **体积、视频** | 3D       | 匹配数据的三维结构         |
+
+**注意**：维度选择不影响正确性，但影响：
+
+- 代码可读性（2D 比 1D 更清晰表达像素坐标）
+- 内存访问效率（相邻 Thread 访问相邻内存，提升缓存命中率）
+
+### 三个常见错误及解决方案
+
+**错误 1：Block 不是 32 的倍数**
+
+```cuda
+// ✗ 错误
+kernel<<<10, 100>>>(...)  // 100不是32的倍数
+
+// ✓ 正确
+kernel<<<4, 128>>>(...)   // 128 = 4 × 32
+```
+
+**为什么不好？**
+
+- GPU 以 Warp（32 Thread）为单位执行
+- 100 个 Thread = 3 个 Warp + 4 个空闲
+- 浪费 28 个 Thread 的资源（下一篇详解）
+
+**错误 2：忘记边界检查**
+
+```cuda
+// ✗ 错误
+__global__ void wrong(float* data, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    data[i] = 0;  // 可能 i >= N，越界！
+}
+
+// ✓ 正确
+__global__ void correct(float* data, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {  // 必须检查
+        data[i] = 0;
+    }
+}
+```
+
+**后果**：越界访问导致程序崩溃或数据错误
+
+**错误 3：Block 太大或太小**
+
+```cuda
+// ✗ 太小：资源利用率低
+kernel<<<1000, 32>>>(...)
+
+// ✗ 太大：超过硬件限制
+kernel<<<1, 2048>>>(...)  // 超过1024
+
+// ✓ 合适
+kernel<<<100, 256>>>(...)
+```
+
+**为什么 32 太小？**
+
+- SM 资源闲置（下一篇详解 Occupancy）
+- 启动开销相对高
+
+**为什么 2048 非法？**
+
+- 硬件限制：blockDim.x × y × z ≤ 1024
+
+---
+
+## 11. 总结与展望
+
+### 核心概念回顾
+
+**三层抽象的作用**：
+
+```
+Grid   → 定义并行任务的总规模
+         决定启动多少个Block
+         对应：整个GPU的所有SM
+
+Block  → 协作的基本单位
+         提供Shared Memory和__syncthreads()
+         对应：分配到单个SM执行
+
+Thread → 最小的独立计算任务
+         有独立的寄存器和索引
+         对应：CUDA Core执行
+```
+
+**配置计算流程**：
+
+```
+1. 确定Block大小
+   - 1D: 256或512
+   - 2D: (16,16)或(32,32)
+   - 3D: (8,8,8)或(16,16,4)
+
+2. 计算Grid大小
+   Grid = ⌈数据规模 / Block大小⌉（向上取整）
+
+3. 验证配置
+   - Block是32的倍数？
+   - Thread总数 ≤ 1024？
+   - 代码有边界检查？
+```
+
+**索引计算公式**：
+
+| 维度 | 全局索引计算                                                                               |
+| ---- | ------------------------------------------------------------------------------------------ |
+| 1D   | `i = blockIdx.x * blockDim.x + threadIdx.x`                                                |
+| 2D   | `x = blockIdx.x * blockDim.x + threadIdx.x`<br>`y = blockIdx.y * blockDim.y + threadIdx.y` |
+| 3D   | 同 2D，加上 `z = blockIdx.z * blockDim.z + threadIdx.z`                                    |
+
+### 未解之谜
+
+但这只是开始。为什么有些配置比其他配置快？为什么必须是 32 的倍数？为什么有时 if-else 会让程序慢 10 倍？
+
+这些问题的答案，隐藏在 GPU 的硬件执行模型中。
+
+**下一篇：《CUDA 性能优化 - 理解 Warp 调度与 Occupancy》**
+
+我们将揭开：
+
+- **Warp**：Thread 是软件假象，Warp 才是 GPU 执行的真实单位
+- **线程分歧**：if-else 如何导致 10 倍性能下降
+- **Occupancy**：资源利用率如何影响性能
+- **调度机制**：SM 如何在多个 Warp 间切换

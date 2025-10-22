@@ -4,16 +4,17 @@ const fs = require('fs');
 const path = require('path');
 
 /**
- * Process markdown files in a directory, adding frontmatter with title, date, and categories
+ * Process markdown files in a directory (including subdirectories), adding frontmatter
+ * Can be run multiple times - updates top_order for existing files and processes new ones
  * Usage: node process-markdown.js <directory> <year-month>
- * Example: node process-markdown.js source/_posts/JS_Basic 2023-01
+ * Example: node process-markdown.js source/_posts/JavaScript 2023-01
  */
 
 // Parse command line arguments
 const args = process.argv.slice(2);
 if (args.length !== 2) {
   console.error('Usage: node process-markdown.js <directory> <year-month>');
-  console.error('Example: node process-markdown.js source/_posts/JS_Basic 2023-01');
+  console.error('Example: node process-markdown.js source/_posts/JavaScript 2023-01');
   process.exit(1);
 }
 
@@ -31,50 +32,156 @@ if (!fs.existsSync(dirPath)) {
   process.exit(1);
 }
 
-// Extract category from folder name (last part of path)
+// Extract category from the main folder name (the target directory basename)
 const category = path.basename(dirPath).replace(/_/g, ' ');
 
-// Get all .md files and sort them
-const files = fs.readdirSync(dirPath)
-  .filter(file => file.endsWith('.md'))
-  .sort((a, b) => {
-    // Extract leading numbers for sorting
-    const numA = parseInt(a.match(/^(\d+)/)?.[1] || '0');
-    const numB = parseInt(b.match(/^(\d+)/)?.[1] || '0');
-    return numA - numB;
+/**
+ * Recursively get all .md files from directory and subdirectories
+ */
+function getAllMarkdownFiles(dir, fileList = []) {
+  const files = fs.readdirSync(dir);
+
+  files.forEach(file => {
+    const filePath = path.join(dir, file);
+    const stat = fs.statSync(filePath);
+
+    if (stat.isDirectory()) {
+      // Recursively search subdirectories
+      getAllMarkdownFiles(filePath, fileList);
+    } else if (file.endsWith('.md')) {
+      fileList.push(filePath);
+    }
   });
 
-if (files.length === 0) {
+  return fileList;
+}
+
+/**
+ * Parse frontmatter from content
+ */
+function parseFrontmatter(content) {
+  if (!content.startsWith('---')) {
+    return { hasFrontmatter: false, frontmatter: null, bodyContent: content };
+  }
+
+  const lines = content.split('\n');
+  let endIndex = -1;
+
+  // Find the closing ---
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === '---') {
+      endIndex = i;
+      break;
+    }
+  }
+
+  if (endIndex === -1) {
+    return { hasFrontmatter: false, frontmatter: null, bodyContent: content };
+  }
+
+  const frontmatterLines = lines.slice(1, endIndex);
+  const bodyContent = lines.slice(endIndex + 1).join('\n');
+
+  // Parse frontmatter into object
+  const frontmatter = {};
+  frontmatterLines.forEach(line => {
+    const match = line.match(/^(\w+):\s*(.*)$/);
+    if (match) {
+      const [, key, value] = match;
+      frontmatter[key] = value;
+    }
+  });
+
+  return { hasFrontmatter: true, frontmatter, bodyContent };
+}
+
+// Get all .md files recursively and sort them by their full path
+const allFiles = getAllMarkdownFiles(dirPath);
+
+// Sort files by their numeric prefix and path
+allFiles.sort((a, b) => {
+  const fileNameA = path.basename(a);
+  const fileNameB = path.basename(b);
+
+  // Extract leading numbers for sorting
+  const numA = parseInt(fileNameA.match(/^(\d+)/)?.[1] || '0');
+  const numB = parseInt(fileNameB.match(/^(\d+)/)?.[1] || '0');
+
+  if (numA !== numB) {
+    return numA - numB;
+  }
+
+  // If numbers are equal, sort by full path
+  return a.localeCompare(b);
+});
+
+if (allFiles.length === 0) {
   console.error(`Error: No .md files found in "${dirPath}"`);
   process.exit(1);
 }
 
-console.log(`Found ${files.length} markdown files in "${dirPath}"`);
+console.log(`Found ${allFiles.length} markdown files in "${dirPath}" (including subdirectories)`);
 console.log(`Category: ${category}`);
 console.log(`Date range: ${yearMonth}\n`);
 
-// Generate random dates for each file within the specified month
+// Generate random dates for NEW files only (files without frontmatter)
 const [year, month] = yearMonth.split('-').map(Number);
-const daysInMonth = new Date(year, month, 0).getDate();
-const dates = generateSortedRandomDates(year, month, daysInMonth, files.length);
+
+// Separate files into existing (with frontmatter) and new (without frontmatter)
+const fileStatus = allFiles.map(filePath => {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const { hasFrontmatter, frontmatter } = parseFrontmatter(content);
+  return { filePath, hasFrontmatter, existingDate: frontmatter?.date };
+});
+
+const newFilesCount = fileStatus.filter(f => !f.hasFrontmatter).length;
+const dates = generateSortedRandomDates(year, month, newFilesCount);
+let dateIndex = 0;
 
 // Process each file
-files.forEach((file, index) => {
-  const filePath = path.join(dirPath, file);
+allFiles.forEach((filePath, index) => {
   const content = fs.readFileSync(filePath, 'utf8');
+  const fileName = path.basename(filePath);
+  const relativePath = path.relative(dirPath, filePath);
 
   // Extract title from filename (remove number prefix and .md extension)
-  const titleMatch = file.match(/^\d+\.(.+)\.md$/);
-  const title = titleMatch ? titleMatch[1] : file.replace(/\.md$/, '');
+  // Handles formats like: 00.title.md, 0010.title.md -> title
+  const titleMatch = fileName.match(/^\d+\.(.+)\.md$/);
+  let title = titleMatch ? titleMatch[1] : fileName.replace(/\.md$/, '');
 
-  // Check if file already has frontmatter
-  if (content.startsWith('---')) {
-    console.log(`⚠️  Skipping ${file} (already has frontmatter)`);
+  // Also remove leading digits and dot from the title itself (e.g., "00.something" -> "something")
+  title = title.replace(/^\d+\.\s*/, '');
+
+  // Calculate top_order (10, 20, 30, ...)
+  const topOrder = (index + 1) * 10;
+
+  const { hasFrontmatter, frontmatter, bodyContent } = parseFrontmatter(content);
+
+  if (hasFrontmatter) {
+    // Update existing file - only update top_order
+    const dateToUse = frontmatter.date || dates[dateIndex++];
+
+    // Reconstruct frontmatter with updated top_order
+    const updatedFrontmatter = `---
+title: ${frontmatter.title || title}
+date: ${dateToUse}
+categories:
+  - ${frontmatter.categories || category}
+top_order: ${topOrder}
+---
+${bodyContent}`;
+
+    fs.writeFileSync(filePath, updatedFrontmatter, 'utf8');
+    console.log(`🔄 Updated: ${relativePath}`);
+    console.log(`   Top Order: ${topOrder} (updated)`);
     return;
   }
 
+  // New file - process completely
+  const dateToUse = dates[dateIndex++];
+
   // Remove the first # heading from content
-  let processedContent = content;
+  let processedContent = bodyContent;
 
   // Match first heading (# Title or ## Title, etc.) and remove it
   processedContent = processedContent.replace(/^#\s+.+$/m, '').trim();
@@ -117,11 +224,12 @@ files.forEach((file, index) => {
   const restContent = lines.slice(previewEndIndex + 1).join('\n').trim();
 
   // Generate frontmatter with preview content before <!--more-->
-  const frontmatter = `---
+  const newContent = `---
 title: ${title}
-date: ${dates[index]}
+date: ${dateToUse}
 categories:
   - ${category}
+top_order: ${topOrder}
 ---
 
 ${previewContent}
@@ -131,32 +239,42 @@ ${previewContent}
 ${restContent}`;
 
   // Write back to file
-  fs.writeFileSync(filePath, frontmatter, 'utf8');
-  console.log(`✅ Processed: ${file}`);
+  fs.writeFileSync(filePath, newContent, 'utf8');
+  console.log(`✅ Processed: ${relativePath}`);
   console.log(`   Title: ${title}`);
-  console.log(`   Date: ${dates[index]}`);
+  console.log(`   Date: ${dateToUse}`);
+  console.log(`   Top Order: ${topOrder}`);
 });
 
-console.log(`\n✨ Successfully processed ${files.length} files!`);
+console.log(`\n✨ Successfully processed ${allFiles.length} files!`);
 
 /**
- * Generate sorted random dates within a month
+ * Generate sorted random dates within a month (night time only: 19:00 - 23:59)
  * @param {number} year - Year
  * @param {number} month - Month (1-12)
- * @param {number} daysInMonth - Number of days in the month
  * @param {number} count - Number of dates to generate
  * @returns {string[]} Array of date strings in format YYYY-MM-DD HH:mm:ss
  */
-function generateSortedRandomDates(year, month, daysInMonth, count) {
+function generateSortedRandomDates(year, month, count) {
   const dates = [];
+  const daysInMonthActual = new Date(year, month, 0).getDate();
 
-  // Generate random timestamps within the month
-  const monthStart = new Date(year, month - 1, 1).getTime();
-  const monthEnd = new Date(year, month, 0, 23, 59, 59).getTime();
-
+  // Generate random timestamps for each file
   for (let i = 0; i < count; i++) {
-    const randomTime = monthStart + Math.random() * (monthEnd - monthStart);
-    dates.push(randomTime);
+    // Random day in the month (1 to daysInMonth)
+    const day = Math.floor(Math.random() * daysInMonthActual) + 1;
+
+    // Random hour between 19:00 and 23:59 (19-23)
+    const hour = Math.floor(Math.random() * 5) + 19; // 19, 20, 21, 22, 23
+
+    // Random minute (0-59)
+    const minute = Math.floor(Math.random() * 60);
+
+    // Random second (0-59)
+    const second = Math.floor(Math.random() * 60);
+
+    const timestamp = new Date(year, month - 1, day, hour, minute, second).getTime();
+    dates.push(timestamp);
   }
 
   // Sort dates chronologically

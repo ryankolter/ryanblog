@@ -81,41 +81,40 @@ files.forEach((file, index) => {
 
   // Extract first paragraph or section for preview (before <!--more-->)
   const lines = processedContent.split('\n');
-  let previewLines = [];
-  let remainingLines = [];
+  let previewEndIndex = -1;
   let previewWordCount = 0;
-  let foundEnoughContent = false;
+  let startedContent = false;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
 
     // Skip empty lines at the beginning
-    if (previewLines.length === 0 && line === '') {
+    if (!startedContent && line === '') {
       continue;
+    }
+
+    if (line !== '') {
+      startedContent = true;
     }
 
     // Count words (roughly) to get about 2-3 lines of content
     const words = line.split(/\s+/).filter(w => w.length > 0).length;
     previewWordCount += words;
 
-    previewLines.push(lines[i]);
-
     // Stop after we have enough content (about 50-100 words or hit a section break)
     if (previewWordCount >= 50 || (line === '' && previewWordCount >= 20)) {
-      foundEnoughContent = true;
-      remainingLines = lines.slice(i + 1);
+      previewEndIndex = i;
       break;
     }
   }
 
-  // If we didn't find enough content, use first 3 non-empty lines
-  if (!foundEnoughContent) {
-    previewLines = lines.slice(0, Math.min(5, lines.length));
-    remainingLines = lines.slice(Math.min(5, lines.length));
+  // If we didn't find enough content, use first 5 lines
+  if (previewEndIndex === -1) {
+    previewEndIndex = Math.min(5, lines.length - 1);
   }
 
-  const previewContent = previewLines.join('\n').trim();
-  const restContent = remainingLines.join('\n').trim();
+  const previewContent = lines.slice(0, previewEndIndex + 1).join('\n').trim();
+  const restContent = lines.slice(previewEndIndex + 1).join('\n').trim();
 
   // Generate frontmatter with preview content before <!--more-->
   const frontmatter = `---

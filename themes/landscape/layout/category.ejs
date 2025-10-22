@@ -1,1 +1,8 @@
-<%- partial('_partial/archive', {expand: false, index: true}) %>
+<% if (page.type === 'categories') { %>
+  <div class="category-list-container">
+    <h2>All Categories</h2>
+    <%- list_categories_blank({show_count: true, class: 'category-list'}) %>
+  </div>
+<% } else { %>
+  <%- partial('_partial/archive', {expand: false, index: true}) %>
+<% } %>

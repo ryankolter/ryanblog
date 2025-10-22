@@ -36,3 +36,47 @@ else
   a
     margin-right: 5px
     display: inline-block
+
+.category-list-container
+  h2
+    font-size: 1.8em
+    margin-bottom: 20px
+    color: #333
+    font-weight: 600
+  .category-list
+    list-style: none
+    margin: 0
+    padding: 0
+    display: grid
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr))
+    gap: 15px
+    .category-list-item
+      position: relative
+      background: #2d2d2d
+      border-radius: 6px
+      border: 1px solid #3d3d3d
+      transition: background 0.3s ease, border-color 0.3s ease
+      &:hover
+        background: #3d3d3d
+        border-color: #4691ae
+      .category-list-link
+        display: block
+        padding: 15px 20px
+        font-size: 1.2em
+        font-weight: 500
+        color: #4691ae
+        text-decoration: none
+        &:hover
+          color: #5db8e8
+      .category-list-count
+        position: absolute
+        right: 20px
+        top: 50%
+        transform: translateY(-50%)
+        color: #888
+        font-weight: 600
+        padding: 2px 8px
+        background: #1a1a1a
+        border-radius: 12px
+        font-size: 0.9em
+        pointer-events: none

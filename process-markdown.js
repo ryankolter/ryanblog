@@ -219,20 +219,20 @@ ${bodyContent}`;
       startedContent = true;
     }
 
-    // Count words (roughly) to get about 2-3 lines of content
+    // Count words (roughly) to get about 1-2 lines of content
     const words = line.split(/\s+/).filter(w => w.length > 0).length;
     previewWordCount += words;
 
-    // Stop after we have enough content (about 50-100 words or hit a section break)
-    if (previewWordCount >= 50 || (line === '' && previewWordCount >= 20)) {
+    // Stop after we have enough content (about 20-30 words or hit a section break)
+    if (previewWordCount >= 25 || (line === '' && previewWordCount >= 15)) {
       previewEndIndex = i;
       break;
     }
   }
 
-  // If we didn't find enough content, use first 5 lines
+  // If we didn't find enough content, use first 2-3 lines
   if (previewEndIndex === -1) {
-    previewEndIndex = Math.min(5, lines.length - 1);
+    previewEndIndex = Math.min(2, lines.length - 1);
   }
 
   const previewContent = lines.slice(0, previewEndIndex + 1).join('\n').trim();

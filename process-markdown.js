@@ -98,21 +98,43 @@ function parseFrontmatter(content) {
 // Get all .md files recursively and sort them by their full path
 const allFiles = getAllMarkdownFiles(dirPath);
 
-// Sort files by their numeric prefix and path
+/**
+ * Extract numeric prefix from a path component (folder or file name)
+ */
+function getNumericPrefix(name) {
+  const match = name.match(/^(\d+)/);
+  return match ? parseInt(match[1]) : 0;
+}
+
+// Sort files by folder hierarchy first, then by file name
 allFiles.sort((a, b) => {
-  const fileNameA = path.basename(a);
-  const fileNameB = path.basename(b);
+  // Get relative paths from the base directory
+  const relPathA = path.relative(dirPath, a);
+  const relPathB = path.relative(dirPath, b);
 
-  // Extract leading numbers for sorting
-  const numA = parseInt(fileNameA.match(/^(\d+)/)?.[1] || '0');
-  const numB = parseInt(fileNameB.match(/^(\d+)/)?.[1] || '0');
+  // Split paths into components (folders and file)
+  const partsA = relPathA.split(path.sep);
+  const partsB = relPathB.split(path.sep);
 
-  if (numA !== numB) {
-    return numA - numB;
+  // Compare each level of the path hierarchy
+  const minLength = Math.min(partsA.length, partsB.length);
+
+  for (let i = 0; i < minLength; i++) {
+    const numA = getNumericPrefix(partsA[i]);
+    const numB = getNumericPrefix(partsB[i]);
+
+    if (numA !== numB) {
+      return numA - numB;
+    }
+
+    // If numeric prefixes are equal, compare lexicographically
+    if (partsA[i] !== partsB[i]) {
+      return partsA[i].localeCompare(partsB[i]);
+    }
   }
 
-  // If numbers are equal, sort by full path
-  return a.localeCompare(b);
+  // If all parts are equal up to minLength, shorter path comes first
+  return partsA.length - partsB.length;
 });
 
 if (allFiles.length === 0) {
@@ -124,19 +146,11 @@ console.log(`Found ${allFiles.length} markdown files in "${dirPath}" (including 
 console.log(`Category: ${category}`);
 console.log(`Date range: ${yearMonth}\n`);
 
-// Generate random dates for NEW files only (files without frontmatter)
+// Generate dates for ALL files (both new and existing) to maintain chronological order
 const [year, month] = yearMonth.split('-').map(Number);
 
-// Separate files into existing (with frontmatter) and new (without frontmatter)
-const fileStatus = allFiles.map(filePath => {
-  const content = fs.readFileSync(filePath, 'utf8');
-  const { hasFrontmatter, frontmatter } = parseFrontmatter(content);
-  return { filePath, hasFrontmatter, existingDate: frontmatter?.date };
-});
-
-const newFilesCount = fileStatus.filter(f => !f.hasFrontmatter).length;
-const dates = generateSortedRandomDates(year, month, newFilesCount);
-let dateIndex = 0;
+// Generate sorted dates for all files to maintain order
+const dates = generateSortedRandomDates(year, month, allFiles.length);
 
 // Process each file
 allFiles.forEach((filePath, index) => {
@@ -157,11 +171,12 @@ allFiles.forEach((filePath, index) => {
 
   const { hasFrontmatter, frontmatter, bodyContent } = parseFrontmatter(content);
 
-  if (hasFrontmatter) {
-    // Update existing file - only update top_order
-    const dateToUse = frontmatter.date || dates[dateIndex++];
+  // Use date from sorted dates array to maintain chronological order
+  const dateToUse = dates[index];
 
-    // Reconstruct frontmatter with updated top_order
+  if (hasFrontmatter) {
+    // Update existing file - update both top_order and date to maintain order
+    // Reconstruct frontmatter with updated top_order and date
     const updatedFrontmatter = `---
 title: ${frontmatter.title || title}
 date: ${dateToUse}
@@ -173,12 +188,12 @@ ${bodyContent}`;
 
     fs.writeFileSync(filePath, updatedFrontmatter, 'utf8');
     console.log(`🔄 Updated: ${relativePath}`);
+    console.log(`   Date: ${dateToUse} (updated)`);
     console.log(`   Top Order: ${topOrder} (updated)`);
     return;
   }
 
   // New file - process completely
-  const dateToUse = dates[dateIndex++];
 
   // Remove the first # heading from content
   let processedContent = bodyContent;

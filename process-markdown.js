@@ -206,9 +206,15 @@ ${bodyContent}`;
   let previewEndIndex = -1;
   let previewWordCount = 0;
   let startedContent = false;
+  let inCodeBlock = false;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+
+    // Track if we're inside a code block
+    if (line.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+    }
 
     // Skip empty lines at the beginning
     if (!startedContent && line === '') {
@@ -224,7 +230,8 @@ ${bodyContent}`;
     previewWordCount += words;
 
     // Stop after we have enough content (about 20-30 words or hit a section break)
-    if (previewWordCount >= 25 || (line === '' && previewWordCount >= 15)) {
+    // IMPORTANT: Only stop if we're NOT inside a code block!
+    if (!inCodeBlock && (previewWordCount >= 25 || (line === '' && previewWordCount >= 15))) {
       previewEndIndex = i;
       break;
     }
@@ -233,6 +240,23 @@ ${bodyContent}`;
   // If we didn't find enough content, use first 2-3 lines
   if (previewEndIndex === -1) {
     previewEndIndex = Math.min(2, lines.length - 1);
+
+    // Make sure we end outside a code block
+    inCodeBlock = false;
+    for (let i = 0; i <= previewEndIndex; i++) {
+      if (lines[i].trim().startsWith('```')) {
+        inCodeBlock = !inCodeBlock;
+      }
+    }
+    // If we ended inside a code block, extend to the closing ```
+    if (inCodeBlock) {
+      for (let i = previewEndIndex + 1; i < lines.length; i++) {
+        if (lines[i].trim().startsWith('```')) {
+          previewEndIndex = i;
+          break;
+        }
+      }
+    }
   }
 
   const previewContent = lines.slice(0, previewEndIndex + 1).join('\n').trim();
